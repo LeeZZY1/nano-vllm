@@ -299,14 +299,14 @@ def plot_timeline(result: Dict[str, Any], save_path: str = None):
     plt.close()
 
 
-def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: str = None):
+def main(model_path: str, chunk_size: int, enable_chunked_prefill: bool = True, max_num_prefill_seqs: int = 2, save_results: str = None, save_plot: str = None):
     """主函数"""
     
     # 配置名称
-    if chunk_size >= 999999:
-        config_name = f"Chunked Prefill DISABLED (chunk_size={chunk_size})"
+    if not enable_chunked_prefill:
+        config_name = f"Chunked Prefill DISABLED"
     else:
-        config_name = f"Chunked Prefill ENABLED (chunk_size={chunk_size})"
+        config_name = f"Chunked Prefill ENABLED (chunk={chunk_size}, max_prefill={max_num_prefill_seqs})"
     
     # 生成测试 prompts
     vocab_size = 10000
@@ -323,7 +323,7 @@ def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: 
         for _ in range(5)
     ]
     
-    llm = LLM(model_path, max_model_len=8192, chunk_prefill_size=chunk_size)
+    llm = LLM(model_path, max_model_len=8192, chunked_prefill_size=chunk_size, enable_chunked_prefill=enable_chunked_prefill, max_num_prefill_seqs=max_num_prefill_seqs)
     
     # 采样参数
     sampling_params = SamplingParams(
@@ -357,14 +357,20 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Token generation timeline benchmark")
     parser.add_argument("--model", type=str, 
-                       default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
-                       help="Path to model")
-    parser.add_argument("--chunk-size", type=int, default=999999, 
-                       help="Chunk size for prefill (999999 to disable)")
+                       default="/mnt/workspace/models/Qwen/Qwen3-0.6B",) # /mnt/workspace/models/Qwen/Qwen3-0.6B
+    parser.add_argument("--chunk-size", type=int, default=512,
+                       help="Chunk size for prefill")
+    parser.add_argument("--no-chunked-prefill", action="store_true",
+                       help="Disable chunked prefill (all prefill before decode)")
+    parser.add_argument("--max-prefill-seqs", type=int, default=2,
+                       help="Max concurrent prefill sequences per step")
     parser.add_argument("--save-results", type=str, default=None, 
                        help="Save results to JSON file")
-    parser.add_argument("--save-plot", type=str, default="timeline_disable.png", 
+    parser.add_argument("--save-plot", type=str, default="timeline.png", 
                        help="Save plot to image file")
     args = parser.parse_args()
     
-    main(args.model, args.chunk_size, args.save_results, args.save_plot)
+    main(args.model, args.chunk_size, 
+         enable_chunked_prefill=not args.no_chunked_prefill,
+         max_num_prefill_seqs=args.max_prefill_seqs,
+         save_results=args.save_results, save_plot=args.save_plot)

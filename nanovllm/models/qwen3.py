@@ -42,14 +42,16 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
+        _QKVLinear = QKVParallelLinear
+        _RowLinear = RowParallelLinear
+        self.qkv_proj = _QKVLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = _RowLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -98,12 +100,14 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        _MergedLinear = MergedColumnParallelLinear
+        _RowLinear = RowParallelLinear
+        self.gate_up_proj = _MergedLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = _RowLinear(
             intermediate_size,
             hidden_size,
             bias=False,

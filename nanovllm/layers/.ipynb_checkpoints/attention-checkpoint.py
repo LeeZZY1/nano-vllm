@@ -63,33 +63,125 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
+#     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+#         o: torch.Tensor
+#         q = q.view(-1, self.num_heads, self.head_dim)
+#         k = k.view(-1, self.num_kv_heads, self.head_dim)
+#         v = v.view(-1, self.num_kv_heads, self.head_dim)
+#         context = get_context()
+#         k_cache, v_cache = self.k_cache, self.v_cache
+#         if k_cache.numel() and v_cache.numel():
+#             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+#         if context.is_prefill:
+#         #     if context.block_tables is not None:  # prefix cache
+#         #         k, v = k_cache, v_cache
+#         #     o = flash_attn_varlen_func(
+#         #         q,
+#         #         k,
+#         #         v,
+#         #         max_seqlen_q=context.max_seqlen_q,
+#         #         cu_seqlens_q=context.cu_seqlens_q,
+#         #         max_seqlen_k=context.max_seqlen_k,
+#         #         cu_seqlens_k=context.cu_seqlens_k,
+#         #         softmax_scale=self.scale,
+#         #         causal=True,
+#         #         block_table=context.block_tables,
+#         #     )
+#         # 检查是否是混合批次（prefill + decode）
+#             # is_mixed = context.num_prefill_tokens > 0 and context.num_decode_tokens > 0
+#             # 需要确保字段存在且有效
+#             is_mixed = (
+#                 hasattr(context, 'num_prefill_tokens') and 
+#                 hasattr(context, 'num_decode_tokens') and
+#                 context.num_prefill_tokens is not None and 
+#                 context.num_decode_tokens is not None and
+#                 context.num_prefill_tokens > 0 and 
+#                 context.num_decode_tokens > 0
+#             )
+#                         # DEBUG
+#             # print(f"[DEBUG attention] is_mixed={is_mixed}, num_prefill={getattr(context, 'num_prefill_tokens', 'N/A')}, num_decode={getattr(context, 'num_decode_tokens', 'N/A')}, q.shape={q.shape}")
+            
+            
+#             if is_mixed:
+#                 # 混合批次：分别处理 prefill 和 decode，然后合并
+#                 num_prefill = context.num_prefill_tokens
+#                 num_decode = context.num_decode_tokens
+                
+#                 # 分离 prefill 和 decode 部分
+#                 q_prefill = q[:num_prefill]
+#                 q_decode = q[num_prefill:]
+#                 k_prefill = k[:num_prefill]
+#                 v_prefill = v[:num_prefill]
+                
+#                 # 处理 prefill 部分 - 使用 varlen
+#                 # 构建 prefill 的 cu_seqlens
+#                 # 处理 prefill 部分 - 使用 varlen
+#                 # 构建 prefill 的 cu_seqlens，基于实际的 prefill token 数量
+#                 cu_seqlens_prefill = torch.tensor([0, num_prefill], device=q.device, dtype=torch.int32)
+#                 o_prefill = flash_attn_varlen_func(
+#                     q_prefill, k_prefill, v_prefill,
+#                     max_seqlen_q=num_prefill,
+#                     cu_seqlens_q=cu_seqlens_prefill,
+#                     max_seqlen_k=num_prefill,
+#                     cu_seqlens_k=cu_seqlens_prefill,
+#                     softmax_scale=self.scale,
+#                     causal=True
+#                 )
+                
+#                 # 处理 decode 部分 - 使用 kvcache
+#                 # decode 序列从 cache 读取历史 KV
+#                 o_decode = flash_attn_with_kvcache(
+#                     q_decode.unsqueeze(1),  # (num_decode, 1, num_heads, head_dim)
+#                     k_cache,
+#                     v_cache,
+#                     cache_seqlens=context.context_lens[1:] if context.context_lens is not None else None,
+#                     block_table=context.block_tables[1:] if context.block_tables is not None else None,
+#                     softmax_scale=self.scale,
+#                     causal=True
+#                 ).squeeze(1)
+                
+#                 # 合并结果
+#                 o = torch.cat([o_prefill, o_decode], dim=0)
+#             else:
+#                 # 纯 prefill 批次
+#                 if context.block_tables is not None:    # prefix cache
+#                     k, v = k_cache, v_cache
+#                 # o = flash_attn_varlen_func(q, k, v,
+#                 #                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+#                 #                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+#                 #                            softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+#                 # 注意：varlen 不接受 block_table 参数
+#                 o = flash_attn_varlen_func(
+#                     q, k, v,
+#                     max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+#                     max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+#                     softmax_scale=self.scale, causal=True
+#                 )
+#         else:  # decode
+#             o = flash_attn_with_kvcache(
+#                 q.unsqueeze(1),
+#                 k_cache,
+#                 v_cache,
+#                 cache_seqlens=context.context_lens,
+#                 block_table=context.block_tables,
+#                 softmax_scale=self.scale,
+#                 causal=True,
+#             )
+#         o = o.view(-1, self.num_heads * self.head_dim)
+#         return o
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        o: torch.Tensor
+        context = get_context()
+        # 将输入拆分为 [seq, heads, head_dim]
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        context = get_context()
+        
         k_cache, v_cache = self.k_cache, self.v_cache
+
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
         if context.is_prefill:
-        #     if context.block_tables is not None:  # prefix cache
-        #         k, v = k_cache, v_cache
-        #     o = flash_attn_varlen_func(
-        #         q,
-        #         k,
-        #         v,
-        #         max_seqlen_q=context.max_seqlen_q,
-        #         cu_seqlens_q=context.cu_seqlens_q,
-        #         max_seqlen_k=context.max_seqlen_k,
-        #         cu_seqlens_k=context.cu_seqlens_k,
-        #         softmax_scale=self.scale,
-        #         causal=True,
-        #         block_table=context.block_tables,
-        #     )
-        # 检查是否是混合批次（prefill + decode）
-            # is_mixed = context.num_prefill_tokens > 0 and context.num_decode_tokens > 0
-            # 需要确保字段存在且有效
             is_mixed = (
                 hasattr(context, 'num_prefill_tokens') and 
                 hasattr(context, 'num_decode_tokens') and
@@ -98,74 +190,95 @@ class Attention(nn.Module):
                 context.num_prefill_tokens > 0 and 
                 context.num_decode_tokens > 0
             )
-                        # DEBUG
-            # print(f"[DEBUG attention] is_mixed={is_mixed}, num_prefill={getattr(context, 'num_prefill_tokens', 'N/A')}, num_decode={getattr(context, 'num_decode_tokens', 'N/A')}, q.shape={q.shape}")
-            
-            
+
             if is_mixed:
-                # 混合批次：分别处理 prefill 和 decode，然后合并
+                # 混合批次：prefill + decode
                 num_prefill = context.num_prefill_tokens
                 num_decode = context.num_decode_tokens
-                
-                # 分离 prefill 和 decode 部分
+
                 q_prefill = q[:num_prefill]
                 q_decode = q[num_prefill:]
-                k_prefill = k[:num_prefill]
-                v_prefill = v[:num_prefill]
-                
-                # 处理 prefill 部分 - 使用 varlen
-                # 构建 prefill 的 cu_seqlens
-                # 处理 prefill 部分 - 使用 varlen
-                # 构建 prefill 的 cu_seqlens，基于实际的 prefill token 数量
-                cu_seqlens_prefill = torch.tensor([0, num_prefill], device=q.device, dtype=torch.int32)
-                o_prefill = flash_attn_varlen_func(
-                    q_prefill, k_prefill, v_prefill,
-                    max_seqlen_q=num_prefill,
-                    cu_seqlens_q=cu_seqlens_prefill,
-                    max_seqlen_k=num_prefill,
-                    cu_seqlens_k=cu_seqlens_prefill,
-                    softmax_scale=self.scale,
-                    causal=True
-                )
-                
-                # 处理 decode 部分 - 使用 kvcache
-                # decode 序列从 cache 读取历史 KV
-                o_decode = flash_attn_with_kvcache(
-                    q_decode.unsqueeze(1),  # (num_decode, 1, num_heads, head_dim)
-                    k_cache,
-                    v_cache,
-                    cache_seqlens=context.context_lens[1:] if context.context_lens is not None else None,
-                    block_table=context.block_tables[1:] if context.block_tables is not None else None,
-                    softmax_scale=self.scale,
-                    causal=True
-                ).squeeze(1)
-                
+
+                output_parts = []
+
+                # ===== Part A: Prefill =====
+                # 关键修改：也用 with_kvcache 来读历史 cache！
+                if k_cache.numel() and v_cache.numel() and context.block_tables is not None:
+                    # 有历史 KV 缓存，使用 with_kvcache 读取
+                    o_prefill = flash_attn_with_kvcache(
+                        q_prefill.unsqueeze(0),  # [1, num_prefill, heads, dim]
+                        k_cache, v_cache,
+                        block_table=context.block_tables[0:1],  # 取第 0 个序列的 block table
+                        cache_seqlens=context.context_lens[0:1],  # 取第 0 个序列的总长度
+                        softmax_scale=self.scale,
+                        causal=True
+                    ).squeeze(0)  # 回到 [num_prefill, heads, dim]
+                else:
+                    # 无历史缓存（不应该出现在混合批次中）
+                    # 但保险起见，用 varlen 处理
+                    cu_seqlens_prefill = torch.tensor([0, num_prefill], device=q.device, dtype=torch.int32)
+                    o_prefill = flash_attn_varlen_func(
+                        q_prefill, k[:num_prefill], v[:num_prefill],
+                        cu_seqlens_q=cu_seqlens_prefill,
+                        cu_seqlens_k=cu_seqlens_prefill,
+                        max_seqlen_q=num_prefill,
+                        max_seqlen_k=num_prefill,
+                        softmax_scale=self.scale,
+                        causal=True
+                    )
+
+                output_parts.append(o_prefill)
+
+                # ===== Part B: Decode =====
+                if q_decode.numel() > 0 and k_cache.numel() and v_cache.numel():
+                    # decode 部分使用 with_kvcache
+                    o_decode = flash_attn_with_kvcache(
+                        q_decode.unsqueeze(1),  # [num_decode, 1, heads, dim]
+                        k_cache, v_cache,
+                        block_table=context.block_tables[1:] if context.block_tables is not None else None,
+                        cache_seqlens=context.context_lens[1:] if context.context_lens is not None else None,
+                        softmax_scale=self.scale,
+                        causal=True
+                    ).squeeze(1)  # 回到 [num_decode, heads, dim]
+                    output_parts.append(o_decode)
+
                 # 合并结果
-                o = torch.cat([o_prefill, o_decode], dim=0)
+                o = torch.cat(output_parts, dim=0)
+
             else:
-                # 纯 prefill 批次
-                if context.block_tables is not None:    # prefix cache
-                    k, v = k_cache, v_cache
-                # o = flash_attn_varlen_func(q, k, v,
-                #                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                #                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                #                            softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-                # 注意：varlen 不接受 block_table 参数
-                o = flash_attn_varlen_func(
-                    q, k, v,
-                    max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                    max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                    softmax_scale=self.scale, causal=True
-                )
-        else:  # decode
+                # 纯 Prefill
+                if k_cache.numel() and v_cache.numel() and context.block_tables is not None:
+                    # 有历史 KV 缓存（chunked prefill 的后续 chunks）
+                    o = flash_attn_with_kvcache(
+                        q.unsqueeze(0),  # [1, seq_len, heads, dim]
+                        k_cache, v_cache,
+                        block_table=context.block_tables,
+                        cache_seqlens=context.context_lens,
+                        softmax_scale=self.scale,
+                        causal=True
+                    ).squeeze(0)  # 回到 [seq_len, heads, dim]
+                else:
+                    # 无 KV 缓存（第一个 chunk / warmup）
+                    o = flash_attn_varlen_func(
+                        q, k, v,
+                        cu_seqlens_q=context.cu_seqlens_q,
+                        cu_seqlens_k=context.cu_seqlens_k,
+                        max_seqlen_q=context.max_seqlen_q,
+                        max_seqlen_k=context.max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=True
+                    )
+
+        else:
+            # === Pure Decode ===
             o = flash_attn_with_kvcache(
                 q.unsqueeze(1),
-                k_cache,
-                v_cache,
+                k_cache, v_cache,
                 cache_seqlens=context.context_lens,
                 block_table=context.block_tables,
                 softmax_scale=self.scale,
-                causal=True,
-            )
+                causal=True
+            ).squeeze(1)
+
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

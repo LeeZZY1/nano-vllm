@@ -17,7 +17,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    chunk_prefill_size: int = 999999 # chunked prefill的chunk大小，默认设置为很大值禁用
+    chunked_prefill_size: int = 512 # chunked prefill的chunk大小，默认设置为很大值禁用: 999999   512
+    enable_chunked_prefill: bool = True #True  False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

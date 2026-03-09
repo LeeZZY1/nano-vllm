@@ -33,7 +33,7 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
-        self.chunk_size = config.chunk_prefill_size
+        self.chunk_size = config.chunked_prefill_size
 
     def exit(self):
         self.model_runner.call("exit")
@@ -63,10 +63,10 @@ class LLMEngine:
             num_tokens = 0
             for seq in seqs:
                 # 累计记录本次prefill阶段每个seq处理的token数
-                remaining = len(seq) - seq.num_cached_tokens - seq.prefilled_len
+                remaining = len(seq) - seq.num_cached_tokens - seq.prefilled_tokens
                 num_tokens += min(remaining, CHUNK_SIZE)
 
-            num_tokens = sum(seq.prefilled_len for seq in seqs)
+            num_tokens = sum(seq.prefilled_tokens for seq in seqs)
         else:
             num_tokens = -len(seqs)
 

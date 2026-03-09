@@ -357,9 +357,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Token generation timeline benchmark")
     parser.add_argument("--model", type=str, 
-                       default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
-                       help="Path to model")
-    parser.add_argument("--chunk-size", type=int, default=999999, 
+                       default="/mnt/workspace/models/Qwen/Qwen3-0.6B",) # /mnt/workspace/models/Qwen/Qwen3-0.6B
+    parser.add_argument("--chunk-size", type=int, default=512,   # 999999 # 512
                        help="Chunk size for prefill (999999 to disable)")
     parser.add_argument("--save-results", type=str, default=None, 
                        help="Save results to JSON file")

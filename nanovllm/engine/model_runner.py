@@ -24,7 +24,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self.chunk_size = config.chunk_prefill_size
+        self.chunk_size = config.chunked_prefill_size
 
         dist.init_process_group(
             "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
@@ -33,7 +33,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = model_dict[hf_config.model_type](hf_config)
+        model_cls = model_dict[hf_config.model_type]
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -53,6 +54,9 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        if getattr(self, "_exited", False):
+            return
+        self._exited = True
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -61,7 +65,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -86,9 +91,12 @@ class ModelRunner:
         self.shm.buf[4 : n + 4] = data
         for event in self.event:
             event.set()
-
+            
+    # 阻塞调用，等待所有 rank 同步完成 run() 后才返回（多卡必需）
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
+            # write_shm 的作用就是通知其他 rank 同步启动 run()，
+            # 缺了这一步多卡就死锁。
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -110,10 +118,18 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+
+        # 清理缓存，避免上一个实例的缓存影响估算
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        # used = total - free
+        # peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        available_memory = int(total * config.gpu_memory_utilization) - current
+        
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         assert hf_config.hidden_size % hf_config.num_attention_heads == 0
         head_dim = (
@@ -129,10 +145,17 @@ class ModelRunner:
             * head_dim
             * hf_config.torch_dtype.itemsize
         )
-        config.num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
+        # config.num_kvcache_blocks = (
+        #     int(total * config.gpu_memory_utilization - used - peak + current)
+        #     // block_bytes
+        # )
+
+        config.num_kvcache_blocks = available_memory // block_bytes
+        #  回退逻辑，避免断言失败
+        if config.num_kvcache_blocks <= 0:
+            config.num_kvcache_blocks = 1
+            print("[WARN] 可用显存不足，已回退为1个KV块...")
+
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.zeros(
             2,
@@ -158,63 +181,6 @@ class ModelRunner:
             block_tables, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
         return block_tables
-
-    # def prepare_prefill(self, seqs: list[Sequence]):
-    #     input_ids = []
-    #     positions = []
-    #     cu_seqlens_q = [0]
-    #     cu_seqlens_k = [0]
-    #     max_seqlen_q = 0
-    #     max_seqlen_k = 0
-    #     slot_mapping = []
-    #     block_tables = None
-    #     for seq in seqs:
-    #         seqlen = len(seq)
-    #         input_ids.extend(seq[seq.num_cached_tokens :])
-    #         positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-    #         seqlen_q = seqlen - seq.num_cached_tokens
-    #         seqlen_k = seqlen
-    #         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-    #         cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-    #         max_seqlen_q = max(seqlen_q, max_seqlen_q)
-    #         max_seqlen_k = max(seqlen_k, max_seqlen_k)
-    #         if not seq.block_table:
-    #             continue
-    #         for i in range(seq.num_cached_blocks, seq.num_blocks):
-    #             start = seq.block_table[i] * self.block_size
-    #             if i != seq.num_blocks - 1:
-    #                 end = start + self.block_size
-    #             else:
-    #                 end = start + seq.last_block_num_tokens
-    #             slot_mapping.extend(list(range(start, end)))
-    #     if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-    #         block_tables = self.prepare_block_tables(seqs)
-    #     input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
-    #         non_blocking=True
-    #     )
-    #     positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
-    #         non_blocking=True
-    #     )
-    #     cu_seqlens_q = torch.tensor(
-    #         cu_seqlens_q, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     cu_seqlens_k = torch.tensor(
-    #         cu_seqlens_k, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     slot_mapping = torch.tensor(
-    #         slot_mapping, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     set_context(
-    #         True,
-    #         cu_seqlens_q,
-    #         cu_seqlens_k,
-    #         max_seqlen_q,
-    #         max_seqlen_k,
-    #         slot_mapping,
-    #         None,
-    #         block_tables,
-    #     )
-    #     return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -256,11 +222,11 @@ class ModelRunner:
         if num_logits is not None:
             # 使用实际的 logits 数量来决定需要多少个 temperature
             # 这样可以处理 warmup 等场景下序列数量和 logits 数量不匹配的情况
-            if is_prefill and len(seqs) > 1 and num_logits < len(seqs):
-                # 混合批次：第一个是 prefill，其余是 decode
-                # num_logits < len(seqs) 说明第一个序列没有生成 logit
-                start_idx = 1
-                end_idx = num_logits + 1
+            if is_prefill and num_logits < len(seqs):
+                # 混合批次：前 N 个是 prefill 序列，其余是 decode 序列
+                # num_logits < len(seqs) 说明有 prefill 序列的 logit 被跳过
+                start_idx = len(seqs) - num_logits
+                end_idx = len(seqs)
             else:
                 # 纯 prefill 或纯 decode，取前 num_logits 个序列
                 start_idx = 0
@@ -273,10 +239,10 @@ class ModelRunner:
             is_mixed_batch = False
             if is_prefill and len(seqs) > 1:
                 first_seq = seqs[0]
-                remaining = len(first_seq) - first_seq.num_cached_tokens - first_seq.prefilled_len
+                remaining = len(first_seq) - first_seq.num_cached_tokens - first_seq.prefilled_tokens
                 if remaining > 0:
                     is_mixed_batch = all(
-                        len(s) - s.num_cached_tokens - s.prefilled_len <= 0
+                        len(s) - s.num_cached_tokens - s.prefilled_tokens <= 0
                         for s in seqs[1:]
                     )
             
@@ -284,8 +250,6 @@ class ModelRunner:
             for seq in seqs[start_idx:]:
                 temperatures.append(seq.temperature)
         # ---------------- 添加chunked prefill逻辑 ------------------
-        # for seq in seqs:
-        #     temperatures.append(seq.temperature)
         temperatures = torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=True
         ).cuda(non_blocking=True)
@@ -330,25 +294,25 @@ class ModelRunner:
         if self.rank == 0 and is_prefill and len(seqs) > 1:
             # print(f"\n[DEBUG run] Mixed batch: {len(seqs)} seqs")
             for i, seq in enumerate(seqs):
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-                # print(f"  Seq[{i}] id={seq.seq_id}: remaining={remaining}, total_tokens={len(seq)}")
-            # print(f"  input_ids.shape: {input_ids.shape}")
-        
+                remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_tokens
+    
         logits = self.run_model(input_ids, positions, is_prefill)
 
+        if is_prefill:
+            # 计算 prefill 序列数量（prefill 不产出 token，需要跳过其 logits）
+            num_prefill_seqs = sum(
+                1 for seq in seqs
+                if seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_tokens > 0
+            )
+            if num_prefill_seqs > 0 and self.rank == 0:
+                if logits.size(0) > num_prefill_seqs:
+                    # 混合批次：去掉 prefill 序列的 logits，只保留 decode 序列的
+                    logits = logits[num_prefill_seqs:]
+                else:
+                    # 纯 prefill 批次：无需采样
+                    reset_context()
+                    return [] if self.rank == 0 else None
 
-        if is_prefill and len(seqs) > 1:
-            # CHUNK_SIZE = 512
-            CHUNK_SIZE = self.chunk_size
-            # 检查第一个序列是否有 prefill chunk
-            prefill_seq = seqs[0]
-            prompt_remaining = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_len
-            # print(f"[DEBUG strip] prompt_remaining={prompt_remaining}")
-            if prompt_remaining > 0:
-                # 第一个序列是 prefill，丢弃第一行 logits（对应prefill序列）
-                # print(f"[DEBUG strip] original logits.shape={logits.shape}, removing first sequence logits")
-                logits = logits[1:]  # 移除第一行（prefill序列的logits）
-                
         num_logits = logits.size(0) if self.rank == 0 else None
         temperatures = self.prepare_sample(seqs, is_prefill, num_logits) if self.rank == 0 else None
         token_ids = (
@@ -416,36 +380,17 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        num_prefill_seqs = 0  # 统计 prefill 序列数量
         # for seq in seqs:
         for i, seq in enumerate(seqs):
             seqlen = len(seq)
-            # 存储未缓存的token_ids和对应的位置
-            # ---------------- 原始代码 ------------------
-            # input_ids.extend(seq[seq.num_cached_tokens:])
-            # positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-
-            # q序列的长度是未缓存的token数，为什么能减去缓存了的token数？
-            # 因为cached token不需要重新计算attention，只需要计算新生成的token对cached token的attention
-            # 而k序列的长度是整个序列长度，因为k需要包含所有token用于后续的attention计算
-            # seqlen_q = seqlen - seq.num_cached_tokens
-            # seqlen_k = seqlen
-            # ---------------- 原始代码 ------------------
-
-            # ---------------- 修改chunked prefill逻辑 ------------------
-
-           
-            
-            # seqlen_q = min(CHUNK_SIZE, seqlen - start_pos)  # q序列长度为一个chunk大小
-            # seqlen_k = end_pos # k序列长度只包含已经prefill的token
-            # remaining_prefill = seqlen - seq.num_cached_tokens - seq.prefilled_len
-            # 计算剩余需要 prefill 的长度（基于 prompt，不包括已生成的 token）
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_tokens
 
 
-            if prompt_remaining > 0: # 避免warmup时，多个序列进行prefill
-                # prefill,有CHUNK_SIZE个token要进
-                # 从 seq.prefilled_len 开始添加未缓存的 token
-                start_pos = seq.num_cached_tokens + seq.prefilled_len
+            if prompt_remaining > 0: # prefill 序列
+                num_prefill_seqs += 1
+                # 从 seq.prefilled_tokens 开始添加未缓存的 token
+                start_pos = seq.num_cached_tokens + seq.prefilled_tokens
                 end_pos = start_pos + min(CHUNK_SIZE, seqlen - start_pos)
                 seqlen_q = min(CHUNK_SIZE, prompt_remaining)
                 seqlen_k = end_pos
@@ -470,17 +415,12 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            # 对于混合批次，记录每个序列的完整长度（用于 decode 部分读取 KV cache）
-            context_lens.append(seqlen)
+            # 记录每个序列实际的 KV cache 覆盖长度
+            # prefill: end_pos = num_cached + prefilled + chunk_size（已写入 cache 的范围）
+            # decode:  end_pos = seqlen（全部 token 均在 cache 中）
+            context_lens.append(end_pos)
             if not seq.block_table:    # warmup，块表为空是预热阶段，直接跳过
                 continue
-            # for pos in range(start_pos, end_pos):
-            #     block_idx = pos // self.block_size
-            #     block_offset = pos % self.block_size
-            #     if block_idx < len(seq.block_table):
-            #         # 添加token到blcok_table的映射位置
-            #         slot = seq.block_table[block_idx] * self.block_size + block_offset
-            #         slot_mapping.append(slot)
             # 对于 decode 序列（已完成 prefill），使用最后一个 token 的 slot
             # 对于 prefill 序列，遍历所有新 token 的 slot
             if prompt_remaining <= 0:
@@ -496,14 +436,6 @@ class ModelRunner:
                         # 添加token到blcok_table的映射位置
                         slot = seq.block_table[block_idx] * self.block_size + block_offset
                         slot_mapping.append(slot)
-            # for i in range(seq.num_cached_blocks, seq.num_blocks):
-            #     # 计算每个块的开始和结束位置，用于slot_mapping
-            #     start = seq.block_table[i] * self.block_size
-            #     if i != seq.num_blocks - 1:
-            #         end = start + self.block_size
-            #     else:
-            #         end = start + seq.last_block_num_tokens 
-            #     slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             # 说明存在缓存的token，将块表对齐，可以根据块表快速定位缓存位置
             # 这个对齐和同一批次内不同序列之间填充对齐序列长度是不一样的
@@ -525,7 +457,8 @@ class ModelRunner:
         # set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
          # 额外传递混合批次信息：num_prefill_tokens, num_decode_tokens, context_lens
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables,
-                   num_prefill_tokens=num_prefill_tokens, num_decode_tokens=num_decode_tokens)
+                   num_prefill_tokens=num_prefill_tokens, num_decode_tokens=num_decode_tokens,
+                   num_prefill_seqs=num_prefill_seqs)
         ctx = get_context()
         
         

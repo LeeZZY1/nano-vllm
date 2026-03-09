@@ -24,7 +24,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self.chunk_size = config.chunk_prefill_size
+        self.chunk_size = config.chunked_prefill_size
 
         dist.init_process_group(
             "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
@@ -273,10 +273,10 @@ class ModelRunner:
             is_mixed_batch = False
             if is_prefill and len(seqs) > 1:
                 first_seq = seqs[0]
-                remaining = len(first_seq) - first_seq.num_cached_tokens - first_seq.prefilled_len
+                remaining = len(first_seq) - first_seq.num_cached_tokens - first_seq.prefilled_tokens
                 if remaining > 0:
                     is_mixed_batch = all(
-                        len(s) - s.num_cached_tokens - s.prefilled_len <= 0
+                        len(s) - s.num_cached_tokens - s.prefilled_tokens <= 0
                         for s in seqs[1:]
                     )
             
@@ -330,7 +330,7 @@ class ModelRunner:
         if self.rank == 0 and is_prefill and len(seqs) > 1:
             # print(f"\n[DEBUG run] Mixed batch: {len(seqs)} seqs")
             for i, seq in enumerate(seqs):
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_tokens
                 # print(f"  Seq[{i}] id={seq.seq_id}: remaining={remaining}, total_tokens={len(seq)}")
             # print(f"  input_ids.shape: {input_ids.shape}")
         
@@ -342,7 +342,7 @@ class ModelRunner:
             CHUNK_SIZE = self.chunk_size
             # 检查第一个序列是否有 prefill chunk
             prefill_seq = seqs[0]
-            prompt_remaining = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_len
+            prompt_remaining = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_tokens
             # print(f"[DEBUG strip] prompt_remaining={prompt_remaining}")
             if prompt_remaining > 0:
                 # 第一个序列是 prefill，丢弃第一行 logits（对应prefill序列）
@@ -437,15 +437,15 @@ class ModelRunner:
             
             # seqlen_q = min(CHUNK_SIZE, seqlen - start_pos)  # q序列长度为一个chunk大小
             # seqlen_k = end_pos # k序列长度只包含已经prefill的token
-            # remaining_prefill = seqlen - seq.num_cached_tokens - seq.prefilled_len
+            # remaining_prefill = seqlen - seq.num_cached_tokens - seq.prefilled_tokens
             # 计算剩余需要 prefill 的长度（基于 prompt，不包括已生成的 token）
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_tokens
 
 
             if prompt_remaining > 0: # 避免warmup时，多个序列进行prefill
                 # prefill,有CHUNK_SIZE个token要进
-                # 从 seq.prefilled_len 开始添加未缓存的 token
-                start_pos = seq.num_cached_tokens + seq.prefilled_len
+                # 从 seq.prefilled_tokens 开始添加未缓存的 token
+                start_pos = seq.num_cached_tokens + seq.prefilled_tokens
                 end_pos = start_pos + min(CHUNK_SIZE, seqlen - start_pos)
                 seqlen_q = min(CHUNK_SIZE, prompt_remaining)
                 seqlen_k = end_pos
